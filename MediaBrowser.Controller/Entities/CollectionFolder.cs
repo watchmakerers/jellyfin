@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Extensions;
 using Jellyfin.Extensions.Json;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
@@ -192,6 +193,57 @@ namespace MediaBrowser.Controller.Entities
 
         public static void OnCollectionFolderChange()
             => _libraryOptions.Clear();
+
+        /// <summary>
+        /// Gets the path of the file that pins a library's id after it has been renamed.
+        /// </summary>
+        /// <param name="libraryPath">The library's folder, under the root of the user views.</param>
+        /// <returns>The path of the id file.</returns>
+        public static string GetLibraryIdPath(string libraryPath)
+            => System.IO.Path.Combine(libraryPath, "library.id");
+
+        /// <summary>
+        /// Reads the id pinned to a library folder by a rename, if there is one.
+        /// </summary>
+        /// <param name="libraryPath">The library's folder.</param>
+        /// <param name="id">The pinned id.</param>
+        /// <returns><c>true</c> if the folder has a valid pinned id.</returns>
+        public static bool TryReadLibraryId(string libraryPath, out Guid id)
+        {
+            id = Guid.Empty;
+            var idPath = GetLibraryIdPath(libraryPath);
+            try
+            {
+                return File.Exists(idPath)
+                    && Guid.TryParse(File.ReadAllText(idPath).Trim(), out id)
+                    && !id.IsEmpty();
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        /// <inheritdoc />
+        internal override ItemUpdateType UpdateFromResolvedItem(BaseItem newItem)
+        {
+            var updateType = base.UpdateFromResolvedItem(newItem);
+
+            // A renamed library keeps its id (see GetLibraryIdPath), so the existing item is found
+            // under its new folder. Take over the new path and name instead of leaving the old ones.
+            if (newItem is CollectionFolder && !string.Equals(Path, newItem.Path, StringComparison.Ordinal))
+            {
+                Path = newItem.Path;
+                Name = newItem.Name;
+                updateType |= ItemUpdateType.MetadataImport;
+            }
+
+            return updateType;
+        }
 
         public override bool IsSaveLocalMetadataEnabled()
         {

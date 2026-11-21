@@ -26,6 +26,7 @@ using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -41,6 +42,7 @@ public class LibraryStructureController : BaseJellyfinApiController
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly IDirectoryService _directoryService;
     private readonly IUserManager _userManager;
+    private readonly ILogger<LibraryStructureController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="LibraryStructureController"/> class.
@@ -50,18 +52,21 @@ public class LibraryStructureController : BaseJellyfinApiController
     /// <param name="libraryMonitor">Instance of <see cref="ILibraryMonitor"/> interface.</param>
     /// <param name="directoryService">Instance of <see cref="IDirectoryService"/> interface.</param>
     /// <param name="userManager">Instance of <see cref="IUserManager"/> interface.</param>
+    /// <param name="logger">Instance of the <see cref="ILogger{LibraryStructureController}"/> interface.</param>
     public LibraryStructureController(
         IServerConfigurationManager serverConfigurationManager,
         ILibraryManager libraryManager,
         ILibraryMonitor libraryMonitor,
         IDirectoryService directoryService,
-        IUserManager userManager)
+        IUserManager userManager,
+        ILogger<LibraryStructureController> logger)
     {
         _appPaths = serverConfigurationManager.ApplicationPaths;
         _libraryManager = libraryManager;
         _libraryMonitor = libraryMonitor;
         _directoryService = directoryService;
         _userManager = userManager;
+        _logger = logger;
     }
 
     /// <summary>
@@ -185,7 +190,9 @@ public class LibraryStructureController : BaseJellyfinApiController
         // Use the stored ID when possible. The case sensitivity setting may have changed since the library was created.
         var oldLibraryId = oldLibrary?.Id ?? _libraryManager.GetNewItemId(currentPath, typeof(CollectionFolder));
         var oldLibraryName = oldLibrary?.Name ?? Path.GetFileName(currentPath);
-        var newLibraryId = _libraryManager.GetNewItemId(newPath, typeof(CollectionFolder));
+        // The library keeps its id across the rename (pinned below), so everything that refers to it
+        // stays valid. A new id made the old library item get deleted along with its whole contents.
+        var newLibraryId = oldLibraryId;
 
         _libraryMonitor.Stop();
 
@@ -202,6 +209,9 @@ public class LibraryStructureController : BaseJellyfinApiController
             }
 
             _directoryService.Move(currentPath, newPath);
+            await System.IO.File.WriteAllTextAsync(
+                CollectionFolder.GetLibraryIdPath(newPath),
+                oldLibraryId.ToString("N", CultureInfo.InvariantCulture)).ConfigureAwait(false);
 
             await ReplaceLibraryIdInUserPreferencesAsync(
                 oldLibraryId,
@@ -214,41 +224,34 @@ public class LibraryStructureController : BaseJellyfinApiController
         {
             CollectionFolder.OnCollectionFolderChange();
 
-            _ = Task.Run(() => RefreshAfterRenameAsync(newPath, refreshLibrary));
+            _ = Task.Run(() => RefreshAfterRenameAsync(refreshLibrary));
         }
 
         return NoContent();
     }
 
-    private async Task RefreshAfterRenameAsync(string newPath, bool refreshLibrary)
+    private async Task RefreshAfterRenameAsync(bool refreshLibrary)
     {
-        // No need to start if scanning the library because it will handle it
-        if (refreshLibrary)
+        try
         {
-            await _libraryManager.ValidateTopLibraryFolders(CancellationToken.None, true).ConfigureAwait(false);
-            var newLib = _libraryManager.GetUserRootFolder().Children.FirstOrDefault(f => f.Path.Equals(newPath, StringComparison.OrdinalIgnoreCase));
-            if (newLib is CollectionFolder folder)
+            if (refreshLibrary)
             {
-                _libraryManager.ClearIgnoreRuleCache();
-                foreach (var child in folder.GetPhysicalFolders())
-                {
-                    await child.RefreshMetadata(CancellationToken.None).ConfigureAwait(false);
-                    await child.ValidateChildren(new Progress<double>(), CancellationToken.None).ConfigureAwait(false);
-                }
+                // A rename only moves the library's own folder under root/default (its options and
+                // links to the media paths). The media paths and everything in them are untouched,
+                // so re-reading the top-level library list is enough to pick up the new name.
+                // Walking the library's contents here amounted to a full rescan (jellyfin#2451).
+                await _libraryManager.ValidateTopLibraryFolders(CancellationToken.None, true).ConfigureAwait(false);
             }
-            else
-            {
-                _libraryManager.ClearIgnoreRuleCache();
-                // We don't know if this one can be validated individually, trigger a new validation
-                _libraryManager.QueueLibraryScan();
-            }
-
-            _libraryManager.ClearIgnoreRuleCache();
         }
-        else
+        catch (Exception ex)
         {
-            // Need to add a delay here or directory watchers may still pick up the changes
-            // Have to block here to allow exceptions to bubble
+            _logger.LogError(ex, "Error refreshing libraries after a rename");
+        }
+        finally
+        {
+            // The monitor was stopped for the move. It used to be restarted only when no refresh was
+            // requested, leaving real-time monitoring off after a rename until the next full scan.
+            // Wait first so the watchers don't pick up the move itself.
             await Task.Delay(1000).ConfigureAwait(false);
             _libraryMonitor.Start();
         }

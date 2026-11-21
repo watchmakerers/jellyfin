@@ -228,7 +228,7 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
 
     [Fact]
     [Priority(1)]
-    public async Task RenameLibrary_UserHasLibraryPreferences_RemapsLibraryId()
+    public async Task RenameLibrary_UserHasLibraryPreferences_KeepsLibraryIdAndRemapsViews()
     {
         const string Name = "rename-prefs-old";
         const string NewName = "rename-prefs-new";
@@ -245,15 +245,13 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
         Assert.Equal(HttpStatusCode.NoContent, createResponse.StatusCode);
 
         var oldId = libraryManager.GetNewItemId(Path.Combine(rootFolderPath, Name), typeof(CollectionFolder));
-        var newId = libraryManager.GetNewItemId(Path.Combine(rootFolderPath, NewName), typeof(CollectionFolder));
-        Assert.NotEqual(oldId, newId);
 
         var oldLibrary = libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>().Single(f => f.Id.Equals(oldId));
 
         var otherId = Guid.NewGuid();
         var user = await userManager.CreateUserAsync("rename-prefs-user");
         user.SetPermission(PermissionKind.EnableAllFolders, false);
-        user.SetPreference(PreferenceKind.EnabledFolders, [otherId, oldId, newId]);
+        user.SetPreference(PreferenceKind.EnabledFolders, [otherId, oldId]);
         user.SetPreference(PreferenceKind.BlockedMediaFolders, [oldId]);
         user.SetPreference(PreferenceKind.EnableContentDeletionFromFolders, [oldId, otherId]);
         user.SetPreference(PreferenceKind.LatestItemExcludes, [oldId]);
@@ -273,24 +271,32 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
             TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.NoContent, renameResponse.StatusCode);
 
+        // The library keeps its id across the rename (jellyfin#2451), so settings that refer to the
+        // library itself are left as they were.
         var reloaded = userManager.GetUserById(user.Id)!;
-        Assert.Equal([otherId, newId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.EnabledFolders));
-        Assert.Equal([newId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.BlockedMediaFolders));
-        Assert.Equal([newId, otherId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.EnableContentDeletionFromFolders));
-        Assert.Equal([newId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.LatestItemExcludes));
+        Assert.Equal([otherId, oldId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.EnabledFolders));
+        Assert.Equal([oldId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.BlockedMediaFolders));
+        Assert.Equal([oldId, otherId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.EnableContentDeletionFromFolders));
+        Assert.Equal([oldId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.LatestItemExcludes));
+        Assert.Equal([oldId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.GroupedFolders));
+
         // The endpoint refreshes in the background; make sure the renamed library has been picked up.
         await libraryManager.ValidateTopLibraryFolders(CancellationToken.None, true);
-        var newLibrary = libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>().Single(f => f.Id.Equals(newId));
+        var newLibrary = libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>().Single(f => f.Id.Equals(oldId));
+        Assert.Equal(NewName, newLibrary.Name);
+        Assert.Equal(Path.Combine(rootFolderPath, NewName), newLibrary.Path);
+
+        // The shadow view's id includes the library name, so it moves to the new name. The user's
+        // own view of the library is keyed by the library id, so it stays the same.
         var newShadowId = libraryManager.GetShadowView(newLibrary, newLibrary.CollectionType, string.Empty).Id;
-        var newUserViewId = libraryManager.GetNamedView(reloaded, newLibrary.Name, newId, newLibrary.CollectionType, string.Empty).Id;
+        var newUserViewId = libraryManager.GetNamedView(reloaded, newLibrary.Name, oldId, newLibrary.CollectionType, string.Empty).Id;
         Assert.NotEqual(oldShadowId, newShadowId);
-        Assert.NotEqual(oldUserViewId, newUserViewId);
+        Assert.Equal(oldUserViewId, newUserViewId);
         Assert.Equal(
-            [otherId.ToString(), newId.ToString(), newShadowId.ToString("N", CultureInfo.InvariantCulture)],
+            [otherId.ToString(), oldId.ToString(), newShadowId.ToString("N", CultureInfo.InvariantCulture)],
             reloaded.GetPreference(PreferenceKind.MyMediaExcludes));
-        Assert.Equal([newId], reloaded.GetPreferenceValues<Guid>(PreferenceKind.GroupedFolders));
         Assert.Equal(
-            [otherId.ToString(), newUserViewId.ToString(), newShadowId.ToString(), newId.ToString()],
+            [otherId.ToString(), newUserViewId.ToString(), newShadowId.ToString(), oldId.ToString()],
             reloaded.GetPreference(PreferenceKind.OrderedViews));
         Assert.Equal(["keep"], reloaded.GetPreference(PreferenceKind.BlockedTags));
 
@@ -305,7 +311,44 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
 
     [Fact]
     [Priority(1)]
-    public async Task RenameLibrary_CapitalizationOnly_LeavesPreferencesAlone()
+    public async Task RenameLibrary_KeepsIdWhenLibrariesAreReResolved()
+    {
+        const string Name = "rename-stable-a";
+        const string NewName = "rename-stable-\u05e1\u05e8\u05d8\u05d9\u05dd";
+
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.AddAuthHeader(_accessToken ??= await AuthHelper.CompleteStartupAsync(client));
+
+        var libraryManager = _factory.Services.GetRequiredService<ILibraryManager>();
+        var rootFolderPath = _factory.Services.GetRequiredService<IServerApplicationPaths>().DefaultUserViewsPath;
+
+        var body = new AddVirtualFolderDto() { LibraryOptions = new LibraryOptions() };
+        using var createResponse = await client.PostAsJsonAsync($"Library/VirtualFolders?name={Name}&collectionType=movies&refreshLibrary=false", body, _jsonOptions, TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.NoContent, createResponse.StatusCode);
+        await libraryManager.ValidateTopLibraryFolders(CancellationToken.None, true);
+        var id = libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>().Single(f => f.Name == Name).Id;
+
+        using var renameResponse = await client.PostAsync(
+            $"Library/VirtualFolders/Name?name={Name}&newName={Uri.EscapeDataString(NewName)}&refreshLibrary=true",
+            null,
+            TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.NoContent, renameResponse.StatusCode);
+
+        // The id is pinned in the library's folder, so it survives re-resolving the libraries from disk.
+        Assert.True(CollectionFolder.TryReadLibraryId(Path.Combine(rootFolderPath, NewName), out var pinned));
+        Assert.Equal(id, pinned);
+        await libraryManager.ValidateTopLibraryFolders(CancellationToken.None, true);
+        var renamed = Assert.Single(libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>(), f => f.Id.Equals(id));
+        Assert.Equal(NewName, renamed.Name);
+        Assert.DoesNotContain(libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>(), f => f.Name == Name);
+
+        using var cleanup = await client.DeleteAsync($"Library/VirtualFolders?name={Uri.EscapeDataString(NewName)}&refreshLibrary=false", TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.NoContent, cleanup.StatusCode);
+    }
+
+    [Fact]
+    [Priority(1)]
+    public async Task RenameLibrary_CapitalizationOnly_KeepsLibraryId()
     {
         const string Name = "rename-case-test";
 
@@ -321,10 +364,9 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
         Assert.Equal(HttpStatusCode.NoContent, createResponse.StatusCode);
 
         var oldId = libraryManager.GetNewItemId(Path.Combine(rootFolderPath, Name), typeof(CollectionFolder));
-        var newId = libraryManager.GetNewItemId(Path.Combine(rootFolderPath, Name.ToUpperInvariant()), typeof(CollectionFolder));
         var oldLibrary = libraryManager.GetUserRootFolder().Children.OfType<CollectionFolder>().Single(f => f.Id.Equals(oldId));
         var oldShadowId = libraryManager.GetShadowView(oldLibrary, oldLibrary.CollectionType, string.Empty).Id;
-        var newShadowId = libraryManager.GetShadowViewId(Name.ToUpperInvariant(), newId, oldLibrary.CollectionType);
+        var newShadowId = libraryManager.GetShadowViewId(Name.ToUpperInvariant(), oldId, oldLibrary.CollectionType);
 
         var user = await userManager.CreateUserAsync("rename-case-user");
         user.SetPreference(PreferenceKind.EnabledFolders, [oldId]);
@@ -337,7 +379,7 @@ public sealed class LibraryStructureControllerTests : IClassFixture<JellyfinAppl
             TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.NoContent, renameResponse.StatusCode);
 
-        Assert.Equal([newId], userManager.GetUserById(user.Id)!.GetPreferenceValues<Guid>(PreferenceKind.EnabledFolders));
+        Assert.Equal([oldId], userManager.GetUserById(user.Id)!.GetPreferenceValues<Guid>(PreferenceKind.EnabledFolders));
         Assert.Equal([newShadowId], userManager.GetUserById(user.Id)!.GetPreferenceValues<Guid>(PreferenceKind.MyMediaExcludes));
 
         using var cleanup = await client.DeleteAsync($"Library/VirtualFolders?name={Name.ToUpperInvariant()}&refreshLibrary=false", TestContext.Current.CancellationToken);

@@ -14,6 +14,21 @@ namespace Emby.Server.Implementations.Library
     public static class ResolverHelper
     {
         /// <summary>
+        /// Gets the id for a newly resolved item. Ids are derived from paths, except for a library
+        /// that has been renamed: it keeps the id it had, so its contents, links and user settings
+        /// still point at it and nothing needs to be rescanned (jellyfin#2451).
+        /// </summary>
+        private static Guid GetItemId(BaseItem item, ILibraryManager libraryManager)
+        {
+            if (item is CollectionFolder && CollectionFolder.TryReadLibraryId(item.Path, out var pinnedId))
+            {
+                return pinnedId;
+            }
+
+            return libraryManager.GetNewItemId(item.Path, item.GetType());
+        }
+
+        /// <summary>
         /// Sets the initial item values.
         /// </summary>
         /// <param name="item">The item.</param>
@@ -33,7 +48,7 @@ namespace Emby.Server.Implementations.Library
                 item.SetParent(parent);
             }
 
-            item.Id = libraryManager.GetNewItemId(item.Path, item.GetType());
+            item.Id = GetItemId(item, libraryManager);
 
             item.IsLocked = item.Path.Contains("[dontfetchmeta]", StringComparison.OrdinalIgnoreCase) ||
                 item.GetParents().Any(i => i.IsLocked);
@@ -73,7 +88,7 @@ namespace Emby.Server.Implementations.Library
                 item.SetParent(args.Parent);
             }
 
-            item.Id = libraryManager.GetNewItemId(item.Path, item.GetType());
+            item.Id = GetItemId(item, libraryManager);
 
             // Make sure the item has a name
             EnsureName(item, args.FileInfo);
