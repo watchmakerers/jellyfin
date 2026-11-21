@@ -100,15 +100,11 @@ namespace MediaBrowser.LocalMetadata.Savers
             // On Windows, saving the file will fail if the file is hidden or readonly
             FileSystem.SetAttributes(path, false, false);
 
-            var fileStreamOptions = new FileStreamOptions()
-            {
-                Mode = FileMode.Create,
-                Access = FileAccess.Write,
-                Share = FileShare.None
-            };
-
-            var filestream = new FileStream(path, fileStreamOptions);
-            await using (filestream.ConfigureAwait(false))
+            // Build the document in memory and only then open (and truncate) the file: the previous
+            // file has to stay readable while the new one is built (see KeepOfflinePlaylistEntries),
+            // and an error while building no longer leaves an empty file behind.
+            var buffer = new MemoryStream();
+            await using (buffer.ConfigureAwait(false))
             {
                 var settings = new XmlWriterSettings
                 {
@@ -117,7 +113,7 @@ namespace MediaBrowser.LocalMetadata.Savers
                     Async = true
                 };
 
-                var writer = XmlWriter.Create(filestream, settings);
+                var writer = XmlWriter.Create(buffer, settings);
                 await using (writer.ConfigureAwait(false))
                 {
                     var root = GetRootElementName(item);
@@ -138,6 +134,20 @@ namespace MediaBrowser.LocalMetadata.Savers
                     await writer.WriteEndElementAsync().ConfigureAwait(false);
 
                     await writer.WriteEndDocumentAsync().ConfigureAwait(false);
+                }
+
+                var fileStreamOptions = new FileStreamOptions()
+                {
+                    Mode = FileMode.Create,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None
+                };
+
+                var filestream = new FileStream(path, fileStreamOptions);
+                await using (filestream.ConfigureAwait(false))
+                {
+                    buffer.Position = 0;
+                    await buffer.CopyToAsync(filestream, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -468,6 +478,41 @@ namespace MediaBrowser.LocalMetadata.Savers
         }
 
         /// <summary>
+        /// Carries over playlist entries whose media is offline. The database only links a playlist to
+        /// items that exist, so while a drive is unplugged its entries are missing from
+        /// <see cref="Folder.LinkedChildren"/>. Rewriting the file from that alone used to drop them for
+        /// good (and empty the playlist entirely if all of its media was on that drive).
+        /// </summary>
+        /// <param name="item">The playlist being saved.</param>
+        /// <param name="paths">The paths of its current entries, in order.</param>
+        /// <returns>The entries to write.</returns>
+        private List<string> KeepOfflinePlaylistEntries(Folder item, List<string> paths)
+        {
+            var previous = PlaylistEntryFile.ReadEntryPaths(GetSavePath(item));
+            if (previous.Count == 0)
+            {
+                return paths;
+            }
+
+            // An entry that is no longer linked but whose item still exists was removed by the user.
+            // One with no item at all is offline: keep it so it comes back with its media.
+            var merged = PlaylistEntryFile.MergeOfflineEntries(
+                paths,
+                previous,
+                path => LibraryManager.FindByPath(path, false) is null);
+
+            if (merged.Count > paths.Count)
+            {
+                Logger.LogInformation(
+                    "Keeping {Count} offline entries of playlist {Name} until their media is available again",
+                    merged.Count - paths.Count,
+                    item.Name);
+            }
+
+            return merged;
+        }
+
+        /// <summary>
         /// Add linked children.
         /// </summary>
         /// <param name="item">The item.</param>
@@ -480,11 +525,6 @@ namespace MediaBrowser.LocalMetadata.Savers
             var linkedChildren = item.LinkedChildren
                 .Where(i => i.Type == LinkedChildType.Manual)
                 .ToList();
-
-            if (linkedChildren.Count == 0)
-            {
-                return;
-            }
 
             // Batch-resolve all ItemIds to paths in a single query to avoid an N+1 round-trip per linked child
             var idsToResolve = new HashSet<Guid>();
@@ -511,22 +551,35 @@ namespace MediaBrowser.LocalMetadata.Savers
                 }
             }
 
-            await writer.WriteStartElementAsync(null, pluralNodeName, null).ConfigureAwait(false);
-
+            var paths = new List<string>(linkedChildren.Count);
             foreach (var link in linkedChildren)
             {
-                string? path = null;
-                if (pathById is not null && link.ItemId.HasValue && pathById.TryGetValue(link.ItemId.Value, out var resolvedPath))
+                if (pathById is not null
+                    && link.ItemId.HasValue
+                    && pathById.TryGetValue(link.ItemId.Value, out var resolvedPath)
+                    && !string.IsNullOrWhiteSpace(resolvedPath))
                 {
-                    path = resolvedPath;
+                    paths.Add(resolvedPath);
                 }
+            }
 
-                if (!string.IsNullOrWhiteSpace(path))
-                {
-                    await writer.WriteStartElementAsync(null, singularNodeName, null).ConfigureAwait(false);
-                    await writer.WriteElementStringAsync(null, "Path", null, path).ConfigureAwait(false);
-                    await writer.WriteEndElementAsync().ConfigureAwait(false);
-                }
+            if (item is Playlist)
+            {
+                paths = KeepOfflinePlaylistEntries(item, paths);
+            }
+
+            if (paths.Count == 0)
+            {
+                return;
+            }
+
+            await writer.WriteStartElementAsync(null, pluralNodeName, null).ConfigureAwait(false);
+
+            foreach (var path in paths)
+            {
+                await writer.WriteStartElementAsync(null, singularNodeName, null).ConfigureAwait(false);
+                await writer.WriteElementStringAsync(null, "Path", null, path).ConfigureAwait(false);
+                await writer.WriteEndElementAsync().ConfigureAwait(false);
             }
 
             await writer.WriteEndElementAsync().ConfigureAwait(false);

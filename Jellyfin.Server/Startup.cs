@@ -154,6 +154,7 @@ namespace Jellyfin.Server
             services.AddHostedService<AutoDiscoveryHost>();
             services.AddHostedService<NfoUserDataSaver>();
             services.AddHostedService<LibraryChangedNotifier>();
+            services.AddHostedService<PlaylistEntryRestoreHost>();
             services.AddHostedService<UserDataChangeNotifier>();
             services.AddHostedService<RecordingNotifier>();
             services.AddHostedService<DeviceAccessHost>();
